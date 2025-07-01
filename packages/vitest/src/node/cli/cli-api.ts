@@ -81,6 +81,11 @@ export async function startVitest(
   }
 
   ctx.onAfterSetServer(() => {
+    // Enable error instrumentation if configured
+    if (process.env.VITEST_ERROR_INSTRUMENTATION || ctx.config.errorInstrumentation) {
+      ctx.errorInstrumentation.enable()
+    }
+    
     if (ctx.config.standalone) {
       ctx.init()
     }
