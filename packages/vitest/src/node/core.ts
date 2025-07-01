@@ -40,6 +40,7 @@ import { VitestSpecifications } from './specifications'
 import { StateManager } from './state'
 import { TestRun } from './test-run'
 import { VitestWatcher } from './watcher'
+import { ErrorInstrumentation } from './instrumentation/error-tracker'
 
 const WATCHER_DEBOUNCE = 100
 
@@ -96,6 +97,7 @@ export class Vitest {
   /** @internal */ vitenode: ViteNodeServer = undefined!
   /** @internal */ runner: ViteNodeRunner = undefined!
   /** @internal */ _testRun: TestRun = undefined!
+  /** @internal */ errorInstrumentation: ErrorInstrumentation
 
   private isFirstRun = true
   private restartsCount = 0
@@ -121,6 +123,7 @@ export class Vitest {
     this.watcher = new VitestWatcher(this).onWatcherRerun(file =>
       this.scheduleRerun([file]), // TODO: error handling
     )
+    this.errorInstrumentation = ErrorInstrumentation.getInstance(this)
   }
 
   private _onRestartListeners: OnServerRestartHandler[] = []
@@ -1046,6 +1049,14 @@ export class Vitest {
   public _checkUnhandledErrors(errors: unknown[]): void {
     if (errors.length && !this.config.dangerouslyIgnoreUnhandledErrors) {
       process.exitCode = 1
+    }
+    
+    // Track each error with instrumentation
+    for (const error of errors) {
+      this.errorInstrumentation.trackError(error, {
+        errorType: 'UnhandledError',
+        severity: 'high' as any
+      })
     }
   }
 

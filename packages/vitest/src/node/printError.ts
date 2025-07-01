@@ -68,6 +68,19 @@ export function printError(
   const project = options.project
     ?? ctx.coreWorkspaceProject
     ?? ctx.projects[0]
+  
+  // Track the error with instrumentation
+  if (ctx.errorInstrumentation) {
+    ctx.errorInstrumentation.trackError(error, {
+      errorType: options.type || 'PrintError',
+      testFile: options.task?.file?.filepath,
+      testName: options.task?.name,
+      projectName: project?.name,
+      pool: options.task?.file?.pool,
+      environment: project?.config.environment
+    }, options.task, project)
+  }
+  
   return printErrorInner(error, project, {
     logger,
     type: options.type,
