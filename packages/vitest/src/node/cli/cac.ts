@@ -2,10 +2,13 @@ import type { CAC, Command } from 'cac'
 import type { VitestRunMode } from '../types/config'
 import type { CliOptions } from './cli-api'
 import type { CLIOption, CLIOptions as CLIOptionsConfig } from './cli-config'
+import { context, SpanStatusCode, trace } from '@opentelemetry/api'
+import { SeverityNumber } from '@opentelemetry/api-logs'
 import { toArray } from '@vitest/utils'
 import cac from 'cac'
 import { normalize } from 'pathe'
 import c from 'tinyrainbow'
+import { initOtel, logger, tracer } from '../../otel'
 import { version } from '../../../package.json' with { type: 'json' }
 import { benchCliOptionsConfig, cliOptionsConfig, collectCliOptionsConfig } from './cli-config'
 
@@ -293,29 +296,81 @@ function normalizeCliOptions(cliFilters: string[], argv: CliOptions): CliOptions
 }
 
 async function start(mode: VitestRunMode, cliFilters: string[], options: CliOptions): Promise<void> {
-  try {
-    process.title = 'node (vitest)'
-  }
-  catch {}
+  // Initialize OpenTelemetry first
+  initOtel()
+
+  const span = tracer.startSpan('vitest.cli.start', {
+    attributes: {
+      'vitest.mode': mode,
+      'vitest.filters.count': cliFilters.length,
+      'vitest.version': version,
+    },
+  })
 
   try {
-    const { startVitest } = await import('./cli-api')
-    const ctx = await startVitest(mode, cliFilters.map(normalize), normalizeCliOptions(cliFilters, options))
-    if (!ctx.shouldKeepServer()) {
-      await ctx.exit()
+    trace.setSpan(context.active(), span)
+
+    logger.emit({
+      severityNumber: SeverityNumber.INFO,
+      severityText: 'INFO',
+      body: 'Starting Vitest CLI',
+      attributes: {
+        mode,
+        filters: cliFilters,
+        version,
+      },
+    })
+
+    try {
+      process.title = 'node (vitest)'
+    }
+    catch {}
+
+    try {
+      const { startVitest } = await import('./cli-api')
+      const ctx = await startVitest(mode, cliFilters.map(normalize), normalizeCliOptions(cliFilters, options))
+
+      span.setAttributes({
+        'vitest.server.keep_alive': ctx.shouldKeepServer(),
+      })
+
+      if (!ctx.shouldKeepServer()) {
+        await ctx.exit()
+      }
+
+      span.setStatus({ code: SpanStatusCode.OK })
+    }
+    catch (e) {
+      span.recordException(e as Error)
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: (e as Error).message,
+      })
+
+      logger.emit({
+        severityNumber: SeverityNumber.ERROR,
+        severityText: 'ERROR',
+        body: 'Vitest startup error',
+        attributes: {
+          error: (e as Error).message,
+          stack: (e as Error).stack,
+        },
+      })
+
+      const { errorBanner } = await import('../reporters/renderers/utils')
+      console.error(`\n${errorBanner('Startup Error')}`)
+      console.error(e)
+      console.error('\n\n')
+
+      if (process.exitCode == null) {
+        process.exitCode = 1
+      }
+
+      process.exit()
     }
   }
-  catch (e) {
-    const { errorBanner } = await import('../reporters/renderers/utils')
-    console.error(`\n${errorBanner('Startup Error')}`)
-    console.error(e)
-    console.error('\n\n')
-
-    if (process.exitCode == null) {
-      process.exitCode = 1
-    }
-
-    process.exit()
+  finally {
+    span.end()
   }
 }
 

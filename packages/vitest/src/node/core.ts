@@ -11,12 +11,15 @@ import type { ResolvedConfig, TestProjectConfiguration, UserConfig, VitestRunMod
 import type { CoverageProvider } from './types/coverage'
 import type { Reporter } from './types/reporter'
 import type { TestRunResult } from './types/tests'
+import { context, SpanStatusCode, trace } from '@opentelemetry/api'
+import { SeverityNumber } from '@opentelemetry/api-logs'
 import { getTasks, hasFailed } from '@vitest/runner/utils'
 import { SnapshotManager } from '@vitest/snapshot/manager'
 import { noop, toArray } from '@vitest/utils'
 import { normalize, relative } from 'pathe'
 import { ViteNodeRunner } from 'vite-node/client'
 import { ViteNodeServer } from 'vite-node/server'
+import { logger, tracer } from '../otel'
 import { version } from '../../package.json' with { type: 'json' }
 import { WebSocketReporter } from '../api/setup'
 import { defaultBrowserPort } from '../constants'
@@ -29,6 +32,7 @@ import { resolveConfig } from './config/resolveConfig'
 import { getCoverageProvider } from './coverage'
 import { FilesNotFoundError } from './errors'
 import { Logger } from './logger'
+import * as metrics from './metrics'
 import { VitestPackageInstaller } from './packageInstaller'
 import { createPool } from './pool'
 import { TestProject } from './project'
@@ -537,48 +541,123 @@ export class Vitest {
    * @param filters String filters to match the test files
    */
   async start(filters?: string[]): Promise<TestRunResult> {
+    const span = tracer.startSpan('vitest.start', {
+      attributes: {
+        'vitest.mode': this.mode,
+        'vitest.filters.count': filters?.length || 0,
+        'vitest.coverage.enabled': this.config.coverage.enabled,
+      },
+    })
+
     try {
-      await this.initCoverageProvider()
-      await this.coverageProvider?.clean(this.config.coverage.clean)
+      trace.setSpan(context.active(), span)
+
+      logger.emit({
+        severityNumber: SeverityNumber.INFO,
+        severityText: 'INFO',
+        body: 'Starting Vitest test run',
+        attributes: {
+          mode: this.mode,
+          filters: filters || [],
+          coverage_enabled: this.config.coverage.enabled,
+        },
+      })
+
+      try {
+        await this.initCoverageProvider()
+        await this.coverageProvider?.clean(this.config.coverage.clean)
+      }
+      finally {
+        await this.report('onInit', this)
+      }
+
+      this.filenamePattern = filters && filters?.length > 0 ? filters : undefined
+      const files = await this.specifications.getRelevantTestSpecifications(filters)
+
+      // if run with --changed, don't exit if no tests are found
+      if (!files.length) {
+        await this._testRun.start([])
+        const coverage = await this.coverageProvider?.generateCoverage?.({ allTestsRun: true })
+
+        await this._testRun.end([], [], coverage)
+        // Report coverage for uncovered files
+        await this.reportCoverage(coverage, true)
+
+        if (!this.config.watch || !(this.config.changed || this.config.related?.length)) {
+          throw new FilesNotFoundError(this.mode)
+        }
+      }
+
+      let testModules: TestRunResult = {
+        testModules: [],
+        unhandledErrors: [],
+      }
+
+      if (files.length) {
+      // populate once, update cache on watch
+        await this.cache.stats.populateStats(this.config.root, files)
+
+        testModules = await this.runFiles(files, true)
+      }
+
+      if (this.config.watch) {
+        await this.report('onWatcherStart')
+      }
+
+      span.setAttributes({
+        'vitest.tests.found': files.length,
+        'vitest.tests.executed': testModules.testModules.length,
+        'vitest.errors.count': testModules.unhandledErrors.length,
+      })
+
+      // Record metrics
+      metrics.testFilesProcessed.add(files.length, { mode: this.mode })
+      metrics.testSuitesExecuted.add(testModules.testModules.length, { mode: this.mode })
+
+      if (testModules.unhandledErrors.length > 0) {
+        metrics.unhandledErrorCount.add(testModules.unhandledErrors.length, { mode: this.mode })
+      }
+
+      // Record system metrics
+      metrics.recordSystemMetrics()
+
+      span.setStatus({ code: SpanStatusCode.OK })
+
+      logger.emit({
+        severityNumber: SeverityNumber.INFO,
+        severityText: 'INFO',
+        body: 'Vitest test run completed',
+        attributes: {
+          tests_found: files.length,
+          tests_executed: testModules.testModules.length,
+          errors_count: testModules.unhandledErrors.length,
+        },
+      })
+
+      return testModules
+    }
+    catch (error) {
+      span.recordException(error as Error)
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: (error as Error).message,
+      })
+
+      logger.emit({
+        severityNumber: SeverityNumber.ERROR,
+        severityText: 'ERROR',
+        body: 'Vitest test run failed',
+        attributes: {
+          error: (error as Error).message,
+          stack: (error as Error).stack,
+        },
+      })
+
+      throw error
     }
     finally {
-      await this.report('onInit', this)
+      span.end()
     }
-
-    this.filenamePattern = filters && filters?.length > 0 ? filters : undefined
-    const files = await this.specifications.getRelevantTestSpecifications(filters)
-
-    // if run with --changed, don't exit if no tests are found
-    if (!files.length) {
-      await this._testRun.start([])
-      const coverage = await this.coverageProvider?.generateCoverage?.({ allTestsRun: true })
-
-      await this._testRun.end([], [], coverage)
-      // Report coverage for uncovered files
-      await this.reportCoverage(coverage, true)
-
-      if (!this.config.watch || !(this.config.changed || this.config.related?.length)) {
-        throw new FilesNotFoundError(this.mode)
-      }
-    }
-
-    let testModules: TestRunResult = {
-      testModules: [],
-      unhandledErrors: [],
-    }
-
-    if (files.length) {
-      // populate once, update cache on watch
-      await this.cache.stats.populateStats(this.config.root, files)
-
-      testModules = await this.runFiles(files, true)
-    }
-
-    if (this.config.watch) {
-      await this.report('onWatcherStart')
-    }
-
-    return testModules
   }
 
   /**
