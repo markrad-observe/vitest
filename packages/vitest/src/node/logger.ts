@@ -4,9 +4,13 @@ import type { TypeCheckError } from '../typecheck/typechecker'
 import type { Vitest } from './core'
 import type { TestProject } from './project'
 import { Console } from 'node:console'
+import { trace } from '@opentelemetry/api'
+import { SeverityNumber } from '@opentelemetry/api-logs'
 import { toArray } from '@vitest/utils'
 import c from 'tinyrainbow'
+import { logger as otelLogger } from '../otel'
 import { highlightCode } from '../utils/colors'
+import * as metrics from './metrics'
 import { printError } from './printError'
 import { divider, errorBanner, formatProjectName, withLabel } from './reporters/renderers/utils'
 import { RandomSequencer } from './sequencers/RandomSequencer'
@@ -54,19 +58,70 @@ export class Logger {
     }
   }
 
+  private getTraceContext() {
+    const activeSpan = trace.getActiveSpan()
+    if (activeSpan) {
+      const spanContext = activeSpan.spanContext()
+      return {
+        traceId: spanContext.traceId,
+        spanId: spanContext.spanId,
+      }
+    }
+    return {}
+  }
+
   log(...args: any[]): void {
     this._clearScreen()
     this.console.log(...args)
+
+    // Emit structured log with trace correlation
+    const traceContext = this.getTraceContext()
+    otelLogger.emit({
+      severityNumber: SeverityNumber.INFO,
+      severityText: 'INFO',
+      body: args.join(' '),
+      attributes: {
+        ...traceContext,
+        'vitest.log.type': 'console',
+        'vitest.log.level': 'info',
+      },
+    })
   }
 
   error(...args: any[]): void {
     this._clearScreen()
     this.console.error(...args)
+
+    // Emit structured log with trace correlation
+    const traceContext = this.getTraceContext()
+    otelLogger.emit({
+      severityNumber: SeverityNumber.ERROR,
+      severityText: 'ERROR',
+      body: args.join(' '),
+      attributes: {
+        ...traceContext,
+        'vitest.log.type': 'console',
+        'vitest.log.level': 'error',
+      },
+    })
   }
 
   warn(...args: any[]): void {
     this._clearScreen()
     this.console.warn(...args)
+
+    // Emit structured log with trace correlation
+    const traceContext = this.getTraceContext()
+    otelLogger.emit({
+      severityNumber: SeverityNumber.WARN,
+      severityText: 'WARN',
+      body: args.join(' '),
+      attributes: {
+        ...traceContext,
+        'vitest.log.type': 'console',
+        'vitest.log.level': 'warn',
+      },
+    })
   }
 
   clearFullScreen(message = ''): void {
@@ -107,6 +162,31 @@ export class Logger {
 
   printError(err: unknown, options: ErrorOptions = {}): void {
     printError(err, this.ctx, this, options)
+
+    // Record error metrics
+    const error = err as Error
+    metrics.recordError(error, 'handled', {
+      error_type: options.type || 'unknown',
+      project: options.project?.name || 'unknown',
+      task: options.task?.name || 'unknown',
+    })
+
+    // Emit structured error log with trace correlation
+    const traceContext = this.getTraceContext()
+    otelLogger.emit({
+      severityNumber: SeverityNumber.ERROR,
+      severityText: 'ERROR',
+      body: `Error: ${error.message || 'Unknown error'}`,
+      attributes: {
+        ...traceContext,
+        'vitest.error.name': error.name || 'Error',
+        'vitest.error.message': error.message || 'Unknown error',
+        'vitest.error.stack': error.stack || '',
+        'vitest.error.type': options.type || 'unknown',
+        'vitest.error.project': options.project?.name || 'unknown',
+        'vitest.error.task': options.task?.name || 'unknown',
+      },
+    })
   }
 
   deprecate(message: string): void {
